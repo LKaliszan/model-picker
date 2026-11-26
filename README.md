@@ -8,8 +8,6 @@ It works in Claude Code (terminal and the desktop app's Code tab). It does not w
 
 ## Install
 
-This repository is private: you need an invitation, and git on your computer must be signed in to GitHub.
-
 In a Claude Code terminal session:
 
 ```
@@ -49,6 +47,10 @@ An accepted change can carry into later prompts.
 - A local log, `~/.claude/mods-logs/model-picker.log`, records decisions, model names, cache token counts and subagent task descriptions. The mod does not upload it.
 - Cost figures are rough estimates. They use API list prices fixed in the code (reference dated 2026-11-03), assume 1,000 output tokens per request, and leave out judge calls and the cost of switching back. They are not your bill. On a subscription, usage is not billed this way.
 - It switches among Haiku 5.5, Sonnet 5.5 and Opus 5.5, so your account needs access to them.
+
+## License
+
+You may install and use unmodified copies, including for work. You may not change or redistribute the code without written permission. This is not an open source license. See [LICENSE](LICENSE) for the full terms.
 
 ## Credit
 
