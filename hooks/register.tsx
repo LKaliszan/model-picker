@@ -23,10 +23,14 @@ import {
 } from './logic'
 
 const JUDGE_MODEL = IDS.haiku
-// Used when the chat has made no request yet: roughly a system prompt and its tools.
-const UNKNOWN_CONTEXT = 25_000
+// A new chat's first request carries the system prompt, tools and instructions. Until one has been measured, assume this.
+const DEFAULT_START = 100_000
+// The measured size of a new chat's first request, kept across chats.
+let startTokens = 0
 // Only these agent types have no model of their own that a rewrite could raise or replace.
 const ROUTABLE_AGENTS = ['general-purpose', 'claude']
+// Prompt sources that can be a person typing. Notifications, schedules, other sessions and plugins are left alone.
+const TYPED_ORIGINS: readonly string[] = ['composer', 'bridge', 'sdk', 'unclassified']
 
 /** ask: confirm every change. auto: set effort alone, still confirm a model change. */
 type Mode = 'ask' | 'auto' | 'off'
@@ -116,7 +120,11 @@ function setRoute(target: Family, base: Family) {
 // Judges the held prompt and updates the route and effort, asking where the mode says to.
 async function choose($: EngineInterface, task: string, runsEffort: Level | null) {
   const base = familyOf(baseModel)
-  if (!base) return
+  if (!base) {
+    lastDecision = `your model ${baseModel} is not one the picker knows, nothing changed`
+    await log($, lastDecision)
+    return
+  }
   const p = await judge($, task, await previousReply($))
   if (!p) {
     lastDecision = 'the judge reply could not be read, nothing changed'
@@ -129,7 +137,8 @@ async function choose($: EngineInterface, task: string, runsEffort: Level | null
 
   const current = route ?? base
   let tokens = contextTokens
-  if (!tokens) tokens = (await $.session.usage()).context.tokens ?? UNKNOWN_CONTEXT
+  // A chat with no request yet: its first one will carry the usual start plus this prompt (about 4 characters per token).
+  if (!tokens) tokens = (await $.session.usage()).context.tokens ?? (startTokens || DEFAULT_START) + Math.ceil(task.length / 4)
   const d: Decision = decide({
     base,
     current,
@@ -213,6 +222,11 @@ async function record($: EngineInterface, asked: string, usage: TurnUsage) {
     ttlMs = FIVE_MIN_MS
     writeMultiplier = 1.25
   }
+  if (!contextTokens) {
+    // The chat's first request: remember its size for the next new chat.
+    startTokens = usage.input_tokens + read + written
+    await $.store.set('startTokens', startTokens)
+  }
   contextTokens = usage.input_tokens + read + written + usage.output_tokens
   const family = familyOf(usage.model)
   if (family) warm[family] = { at: now, tokens: contextTokens, ttlMs }
@@ -229,6 +243,8 @@ export const register: Register = on => {
     })
     const saved = await $.store.get('mode')
     mode = saved === 'auto' || saved === 'off' ? saved : 'ask'
+    const start = Number(await $.store.get('startTokens'))
+    startTokens = Number.isFinite(start) && start > 0 ? start : 0
     return next(e)
   })
 
@@ -243,10 +259,17 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('prompt.submit', async (_, e, next) => {
-    if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') return next(e)
-    const text = e.text.trim()
+  on('prompt.submit', async ($, e, next) => {
+    const kind = e.origin.kind
+    // A host app may label a typed message `sdk` or `unclassified`, so those count too.
+    if (!TYPED_ORIGINS.includes(kind)) {
+      await log($, `prompt not judged: it came from "${kind}"`)
+      return next(e)
+    }
+    // Notes the app adds around the first message are not the task.
+    const text = e.text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim()
     held = mode === 'off' || !text || text.startsWith('/') ? null : text
+    await log($, `prompt from "${kind}": ${held === null ? 'not judged' : 'will be judged'}`)
     return next(e)
   }).catch((_, e, next) => next(e))
 
