@@ -1,6 +1,21 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { costOn, decide, familyOf, HOUR_MS, modelLabel, parsePick, type DecideInput } from './logic'
+import {
+  addJudge,
+  addRequest,
+  costOn,
+  decide,
+  EMPTY_TALLY,
+  familyOf,
+  HOUR_MS,
+  modelLabel,
+  netSaving,
+  parsePick,
+  readTally,
+  tallyLines,
+  usageUsd,
+  type DecideInput,
+} from './logic'
 
 const NOW = 10_000_000
 
@@ -78,6 +93,59 @@ describe('decide', () => {
     const d = decide(chat({ base: 'sonnet', current: 'opus', need: 'haiku' }))
     expect(d.kind).toBe('return')
     expect(d.target).toBe('sonnet')
+  })
+})
+
+describe('savings', () => {
+  const u = { input_tokens: 0, output_tokens: 1000, cache_read_input_tokens: 44_685, cache_creation_input_tokens: 60_268 }
+
+  test('prices a request like the cost estimate does', () => {
+    // Haiku above 100,000 tokens: reads 0.05, writes 0.5 x 1.25, output 2.5 per million.
+    expect(usageUsd('haiku', u).toFixed(4)).toBe('0.0424')
+  })
+
+  test('a switch in a new chat compares with writing the same cache on your model', () => {
+    const t = addRequest(EMPTY_TALLY, { usage: u, ran: 'haiku', own: 'opus', effortChanged: true, ownWarmTokens: 0 })
+    expect(t.switched).toBe(1)
+    expect(t.effortOnly).toBe(0)
+    expect(t.ownUsd.toFixed(4)).toBe('0.3303')
+    expect(netSaving(t) > 0.28).toBe(true)
+  })
+
+  test('a switch away from a warm cache compares with reading it instead', () => {
+    const warm = addRequest(EMPTY_TALLY, { usage: u, ran: 'haiku', own: 'opus', effortChanged: false, ownWarmTokens: 200_000 })
+    // All 104,953 prompt tokens read on Opus at 0.2, plus 1,000 output at 20.
+    expect(warm.ownUsd.toFixed(4)).toBe('0.0410')
+    // Rebuilding the cache on Haiku cost a little more than reading Opus's for this one request.
+    expect(netSaving(warm) < 0).toBe(true)
+  })
+
+  test('a switch up to a stronger model counts as extra cost, not lost saving', () => {
+    const t = addRequest(EMPTY_TALLY, { usage: u, ran: 'opus', own: 'sonnet', effortChanged: false, ownWarmTokens: 200_000 })
+    expect(t.stronger).toBe(1)
+    expect(t.cheaper).toBe(0)
+    expect(t.cheaperSavedUsd).toBe(0)
+    // Opus writes the cache (0.3303) where Sonnet would have read it (0.0205).
+    expect(t.strongerExtraUsd.toFixed(4)).toBe('0.3098')
+    expect(tallyLines(t)).toContain('Stronger models: $0.31 extra')
+    expect(tallyLines(t)).toContain('Cheaper models: none used')
+  })
+
+  test('an effort-only change is counted but not credited', () => {
+    const t = addRequest(EMPTY_TALLY, { usage: u, ran: 'opus', own: 'opus', effortChanged: true, ownWarmTokens: 0 })
+    expect(t.effortOnly).toBe(1)
+    expect(netSaving(t)).toBe(0)
+  })
+
+  test('judge calls are paid out of the saving', () => {
+    const t = addJudge(EMPTY_TALLY, { input_tokens: 1_000_000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, 'haiku')
+    expect(netSaving(t).toFixed(2)).toBe('-0.50')
+    expect(tallyLines(t).at(-1)).toBe('Overall estimated extra cost: $0.50')
+  })
+
+  test('a stored tally with bad values reads as empty fields', () => {
+    expect(readTally({ requests: 3, actualUsd: 'x', ownUsd: -1, cheaperSavedUsd: -0.2 })).toEqual({ ...EMPTY_TALLY, requests: 3, cheaperSavedUsd: -0.2 })
+    expect(readTally(null)).toEqual(EMPTY_TALLY)
   })
 })
 

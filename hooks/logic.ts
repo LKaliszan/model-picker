@@ -205,5 +205,181 @@ ${task.slice(0, 4000)}
 }
 
 export function money(usd: number): string {
-  return usd < 0.01 ? `$${usd.toFixed(3)}` : `$${usd.toFixed(2)}`
+  const a = Math.abs(usd)
+  // Below a cent, show a third digit; exactly nothing is just $0.00.
+  const s = a > 0 && a < 0.01 ? a.toFixed(3) : a.toFixed(2)
+  return `${usd < 0 ? '-' : ''}$${s}`
+}
+
+// ---- Savings dashboard ----
+
+/** Token counts as a request or a judge call reports them. */
+export type Usage = {
+  input_tokens: number
+  output_tokens: number
+  cache_read_input_tokens: number
+  cache_creation_input_tokens: number
+  ephemeral_1h_input_tokens?: number
+}
+
+/** Estimated dollars for these tokens on one model, at the list prices above. */
+export function usageUsd(family: Family, u: Usage): number {
+  const prompt = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+  const p = priceOf(family, prompt)
+  const hour = Math.min(u.ephemeral_1h_input_tokens ?? 0, u.cache_creation_input_tokens)
+  const fiveMin = u.cache_creation_input_tokens - hour
+  return (
+    (u.input_tokens * p.input +
+      u.cache_read_input_tokens * p.read +
+      fiveMin * p.input * 1.25 +
+      hour * p.input * 2 +
+      u.output_tokens * p.output) /
+    1_000_000
+  )
+}
+
+export type Tally = {
+  /** Requests counted: the main chat's, and subagents the picker moved. */
+  requests: number
+  /** Requests sent to another model than your own. */
+  switched: number
+  /** Of those, requests sent to a cheaper model, and what they saved (negative if they cost more). */
+  cheaper: number
+  cheaperSavedUsd: number
+  /** Of those, requests sent to a stronger model, and what they cost on top. */
+  stronger: number
+  strongerExtraUsd: number
+  /** Requests where only the effort was changed: their saving cannot be measured, so it is not counted. */
+  effortOnly: number
+  tokens: number
+  /** Tokens that ran on another model than your own. */
+  switchedTokens: number
+  /** Estimated cost of what was sent. */
+  actualUsd: number
+  /** Estimated cost of the same work on your own model. */
+  ownUsd: number
+  judgeCalls: number
+  judgeUsd: number
+}
+
+export const EMPTY_TALLY: Tally = {
+  requests: 0,
+  switched: 0,
+  cheaper: 0,
+  cheaperSavedUsd: 0,
+  stronger: 0,
+  strongerExtraUsd: 0,
+  effortOnly: 0,
+  tokens: 0,
+  switchedTokens: 0,
+  actualUsd: 0,
+  ownUsd: 0,
+  judgeCalls: 0,
+  judgeUsd: 0,
+}
+
+export function readTally(v: unknown): Tally {
+  if (!v || typeof v !== 'object') return { ...EMPTY_TALLY }
+  const o = v as Record<string, unknown>
+  const t = { ...EMPTY_TALLY }
+  for (const k of Object.keys(t) as (keyof Tally)[]) {
+    const n = Number(o[k])
+    // A cheaper model can cost more for one request, so that sum may be negative.
+    if (Number.isFinite(n) && (n >= 0 || k === 'cheaperSavedUsd')) t[k] = n
+  }
+  return t
+}
+
+export function tokensOf(u: Usage): number {
+  return u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens + u.output_tokens
+}
+
+export type RequestRecord = {
+  usage: Usage
+  /** The model that answered. */
+  ran: Family
+  /** Your own model for this request. */
+  own: Family
+  effortChanged: boolean
+  /**
+   * How many tokens your own model still had cached. Staying on it would have read
+   * those instead of writing them again, so the comparison prices them as reads.
+   */
+  ownWarmTokens: number
+}
+
+export function addRequest(t: Tally, r: RequestRecord): Tally {
+  const tokens = tokensOf(r.usage)
+  const actualUsd = usageUsd(r.ran, r.usage)
+  const switched = r.ran !== r.own
+  let ownUsd = actualUsd
+  if (switched) {
+    const u = r.usage
+    const shift = Math.min(u.cache_creation_input_tokens, Math.max(0, r.ownWarmTokens - u.cache_read_input_tokens))
+    const hour = Math.max(0, (u.ephemeral_1h_input_tokens ?? 0) - shift)
+    ownUsd = usageUsd(r.own, {
+      ...u,
+      cache_read_input_tokens: u.cache_read_input_tokens + shift,
+      cache_creation_input_tokens: u.cache_creation_input_tokens - shift,
+      ephemeral_1h_input_tokens: hour,
+    })
+  }
+  const cheaper = switched && RANK[r.ran] < RANK[r.own]
+  const stronger = switched && RANK[r.ran] > RANK[r.own]
+  return {
+    ...t,
+    requests: t.requests + 1,
+    switched: t.switched + (switched ? 1 : 0),
+    cheaper: t.cheaper + (cheaper ? 1 : 0),
+    cheaperSavedUsd: t.cheaperSavedUsd + (cheaper ? ownUsd - actualUsd : 0),
+    stronger: t.stronger + (stronger ? 1 : 0),
+    strongerExtraUsd: t.strongerExtraUsd + (stronger ? actualUsd - ownUsd : 0),
+    effortOnly: t.effortOnly + (!switched && r.effortChanged ? 1 : 0),
+    tokens: t.tokens + tokens,
+    switchedTokens: t.switchedTokens + (switched ? tokens : 0),
+    actualUsd: t.actualUsd + actualUsd,
+    ownUsd: t.ownUsd + ownUsd,
+  }
+}
+
+export function addJudge(t: Tally, u: Usage, judge: Family): Tally {
+  return { ...t, judgeCalls: t.judgeCalls + 1, judgeUsd: t.judgeUsd + usageUsd(judge, u) }
+}
+
+/** What the picker saved after paying for its judge. Negative means it cost more. */
+export function netSaving(t: Tally): number {
+  return t.ownUsd - t.actualUsd - t.judgeUsd
+}
+
+export function tokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`
+  return String(Math.round(n))
+}
+
+/** The dashboard's lines for one tally, plain text so a pane and a command reply can share them. */
+export function tallyLines(t: Tally): string[] {
+  if (!t.requests && !t.judgeCalls) return ['Nothing recorded yet.']
+  const net = netSaving(t)
+  const share = t.ownUsd > 0 ? Math.round((net / t.ownUsd) * 100) : 0
+  return [
+    `Requests: ${t.requests}, ${t.cheaper} on a cheaper model, ${t.stronger} on a stronger model` +
+      (t.effortOnly ? `, ${t.effortOnly} with only the effort changed` : ''),
+    `Tokens: ${tokenCount(t.tokens)} in all, ${tokenCount(t.switchedTokens)} on another model`,
+    `Cheaper models: ${cheaperText(t)}`,
+    `Stronger models: ${strongerText(t)}`,
+    `Judge: ${money(t.judgeUsd)} for ${t.judgeCalls} calls`,
+    net >= 0
+      ? `Overall estimated saving: ${money(net)}${share ? ` (${share}%)` : ''}`
+      : `Overall estimated extra cost: ${money(-net)}`,
+  ]
+}
+
+export function cheaperText(t: Tally): string {
+  if (!t.cheaper) return 'none used'
+  return t.cheaperSavedUsd >= 0 ? `saved ${money(t.cheaperSavedUsd)}` : `cost ${money(-t.cheaperSavedUsd)} more`
+}
+
+export function strongerText(t: Tally): string {
+  return t.stronger ? `${money(t.strongerExtraUsd)} extra` : 'none used'
 }

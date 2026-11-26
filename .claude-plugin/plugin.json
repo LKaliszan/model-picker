@@ -1,5 +1,5 @@
 {
   "name": "model-picker",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "description": "Suggests a model and effort level per task, with a cache cost check before any model switch"
 }

@@ -13,6 +13,17 @@ import {
   MODEL_NAMES,
   modelLabel,
   money,
+  tokenCount,
+  cheaperText,
+  strongerText,
+  addJudge,
+  addRequest,
+  EMPTY_TALLY,
+  netSaving,
+  readTally,
+  tallyLines,
+  type Tally,
+  type Usage,
   parsePick,
   RANK,
   type Decision,
@@ -27,6 +38,12 @@ const JUDGE_MODEL = IDS.haiku
 const DEFAULT_START = 100_000
 // The measured size of a new chat's first request, kept across chats.
 let startTokens = 0
+// A new name: values saved by 0.2.0 could come from a reload in a long chat.
+const START_KEY = 'chatStartTokens'
+// Totals from 0.2.0 have no split between cheaper and stronger models, so counting starts again.
+const TOTALS_KEY = 'totalsBySwitch'
+// A conversation's first request carries the first message and few others.
+const CHAT_START_MESSAGES = 3
 // Only these agent types have no model of their own that a rewrite could raise or replace.
 const ROUTABLE_AGENTS = ['general-purpose', 'claude']
 // Prompt sources that can be a person typing. Notifications, schedules, other sessions and plugins are left alone.
@@ -58,6 +75,37 @@ const ACCENT = '#d97757'
 
 function liveLabel(l: Live) {
   return `${modelLabel(l.model)}${l.effort ? ` · ${l.effort in LEVEL_NAMES ? LEVEL_NAMES[l.effort as Level] : l.effort}` : ''}`
+}
+
+// ---- Savings dashboard: this chat in memory, all chats in the mod's store ----
+const PANE = 'model-picker-stats'
+const STATS_NOTES = [
+  'Not your bill. On a subscription, usage is not billed this way.',
+  '"Your own models" assumes the same tokens and answers, reading their cache where it was still warm.',
+  'Effort-only changes are not credited. Clear counts with /model-picker stats clear.',
+]
+type Scope = 'chat' | 'all'
+let scope: Scope = 'chat'
+let chatTally: Tally = { ...EMPTY_TALLY }
+let allTally: Tally = { ...EMPTY_TALLY }
+/** Subagents the picker started on a cheaper model, with the model they would have used. */
+const movedAgents = new Map<string, Family>()
+
+async function tally($: EngineInterface, add: (t: Tally) => Tally) {
+  chatTally = add(chatTally)
+  try {
+    // Read again first, so another open chat's counts are not overwritten.
+    allTally = add(readTally(await $.store.get(TOTALS_KEY)))
+    await $.store.set(TOTALS_KEY, allTally)
+  } catch (err) {
+    await log($, `totals not saved: ${err instanceof Error ? err.message : String(err)}`)
+  }
+  redraw($)
+}
+
+function warmTokens(family: Family | null, now: number) {
+  const w = family ? warm[family] : undefined
+  return w && now - w.at < w.ttlMs ? w.tokens : 0
 }
 
 function reset() {
@@ -95,6 +143,7 @@ async function judge($: EngineInterface, task: string, previousReply: string): P
     effort: 'low',
     timeoutMs: 20_000,
   })
+  if (r.usage) await tally($, t => addJudge(t, r.usage as Usage, 'haiku'))
   if (!r.isAnswered) throw new Error(`judge gave no answer: ${r.reason}`)
   return parsePick(r.text)
 }
@@ -211,7 +260,7 @@ async function choose($: EngineInterface, task: string, runsEffort: Level | null
   redraw($)
 }
 
-async function record($: EngineInterface, asked: string, usage: TurnUsage) {
+async function record($: EngineInterface, asked: string, usage: TurnUsage, isChatStart: boolean) {
   const now = await $.clock.now()
   const read = usage.cache_read_input_tokens
   const written = usage.cache_creation_input_tokens
@@ -222,10 +271,11 @@ async function record($: EngineInterface, asked: string, usage: TurnUsage) {
     ttlMs = FIVE_MIN_MS
     writeMultiplier = 1.25
   }
-  if (!contextTokens) {
-    // The chat's first request: remember its size for the next new chat.
+  // Only a conversation's real first request shows what a new chat costs. After a reload,
+  // the mod's memory is empty, but the chat is not, so an empty memory is not enough.
+  if (isChatStart) {
     startTokens = usage.input_tokens + read + written
-    await $.store.set('startTokens', startTokens)
+    await $.store.set(START_KEY, startTokens)
   }
   contextTokens = usage.input_tokens + read + written + usage.output_tokens
   const family = familyOf(usage.model)
@@ -238,12 +288,13 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'model-picker',
-      description: 'Model and effort routing. ask, auto, off, reset, or no word for status',
-      argumentHint: '[ask|auto|off|reset]',
+      description: 'Model and effort routing. ask, auto, off, reset, stats, or no word for status',
+      argumentHint: '[ask|auto|off|reset|stats|stats close|stats clear]',
     })
     const saved = await $.store.get('mode')
     mode = saved === 'auto' || saved === 'off' ? saved : 'ask'
-    const start = Number(await $.store.get('startTokens'))
+    allTally = readTally(await $.store.get(TOTALS_KEY))
+    const start = Number(await $.store.get(START_KEY))
     startTokens = Number.isFinite(start) && start > 0 ? start : 0
     return next(e)
   })
@@ -253,6 +304,8 @@ export const register: Register = on => {
     if (e.reason === 'clear') {
       reset()
       live = null
+      chatTally = { ...EMPTY_TALLY }
+      movedAgents.clear()
       warm = {}
       contextTokens = 0
     }
@@ -274,8 +327,17 @@ export const register: Register = on => {
   }).catch((_, e, next) => next(e))
 
   on('turn.step', async function* ($, e, next) {
-    // Subagents are routed when they start, not here.
-    if (e.agentId !== undefined) return yield* next(e)
+    // Subagents are routed when they start, not here. Only the ones the picker moved are counted.
+    if (e.agentId !== undefined) {
+      const own = movedAgents.get(e.agentId)
+      const result = yield* next(e)
+      const ran = result.usage ? familyOf(result.usage.model) : null
+      if (own && ran && result.usage) {
+        const usage = result.usage
+        await tally($, t => addRequest(t, { usage, ran, own, effortChanged: false, ownWarmTokens: 0 }))
+      }
+      return result
+    }
 
     const runs = typeof e.effort === 'string' ? e.effort : ''
     // The person changed the model or effort by hand: their choice wins.
@@ -305,14 +367,22 @@ export const register: Register = on => {
     const changed = model !== e.model || level !== e.effort
     live = { model, effort: typeof level === 'string' ? level : '', changed }
     redraw($)
+    // What your own model still had cached before this request, for the comparison.
+    const ownWarm = warmTokens(base, await $.clock.now())
     const result = yield* next(changed ? { ...e, model, ...(level === undefined ? {} : { effort: level }) } : e)
+    const ran = result.usage ? familyOf(result.usage.model) : null
+    if (result.usage && ran && base) {
+      const usage = result.usage
+      const effortChanged = level !== e.effort
+      await tally($, t => addRequest(t, { usage, ran, own: base, effortChanged, ownWarmTokens: ownWarm }))
+    }
     if (result.usage) {
       // The model that really answered, in case a fallback stepped in.
       if (live && result.usage.model && result.usage.model !== model) {
         live = { ...live, model: result.usage.model, changed: result.usage.model !== e.model || live.changed }
         redraw($)
       }
-      await record($, model, result.usage)
+      await record($, model, result.usage, e.index === 0 && e.messageCount <= CHAT_START_MESSAGES)
     }
     return result
   })
@@ -333,11 +403,43 @@ export const register: Register = on => {
     if (!target) return next(e)
     await log($, `subagent "${e.description}" on ${IDS[target]} instead of ${e.parentModel}`)
     $.ui.toast(`Subagent on ${MODEL_NAMES[target]}: ${e.description}`)
-    return next({ ...e, model: IDS[target] })
+    const started = await next({ ...e, model: IDS[target] })
+    if (!started.deny && started.agentId) movedAgents.set(started.agentId, parent)
+    return started
   }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'model-picker' }, async ($, e) => {
-    const arg = e.args.trim().toLowerCase()
+    const arg = e.args.trim().toLowerCase().replace(/\s+/g, ' ')
+    if (arg === 'stats clear') {
+      chatTally = { ...EMPTY_TALLY }
+      allTally = { ...EMPTY_TALLY }
+      await $.store.set(TOTALS_KEY, allTally)
+      redraw($)
+      return { text: 'Model picker: savings counts cleared for this chat and all chats.' }
+    }
+    if (arg === 'stats close') {
+      await $.ui.close({ id: PANE })
+      return { text: 'Model picker: savings dashboard closed.' }
+    }
+    if (arg === 'stats') {
+      allTally = readTally(await $.store.get(TOTALS_KEY))
+      const opened = await $.ui.open({ id: PANE, title: 'Model picker savings', closeOnEscape: true })
+      if (opened.isPlaced) {
+        return { text: 'Model picker: savings dashboard opened. Close it with its Close button or /model-picker stats close.' }
+      }
+      // No panel here: give the same figures as text.
+      return {
+        text: [
+          'This chat',
+          ...tallyLines(chatTally),
+          '',
+          'All chats',
+          ...tallyLines(allTally),
+          '',
+          ...STATS_NOTES,
+        ].join('\n'),
+      }
+    }
     if (arg === 'ask' || arg === 'auto' || arg === 'off') {
       mode = arg
       await $.store.set('mode', mode)
@@ -364,9 +466,169 @@ export const register: Register = on => {
         `Effort override: ${effort ? LEVEL_NAMES[effort] : 'none'}`,
         `Last decision: ${lastDecision}`,
         `Last request: ${lastRequest}`,
-        'Type /model-picker ask, auto, off or reset.',
+        'Type /model-picker ask, auto, off or reset, or /model-picker stats for the savings dashboard.',
       ].join('\n'),
     }
+  })
+
+  // The savings dashboard: opened only by /model-picker stats.
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button, Progress } = $.ui.resolve(e)
+    const t = scope === 'chat' ? chatTally : allTally
+    const net = netSaving(t)
+    const tone = net >= 0 ? 'success' : 'warning'
+    const headline = net >= 0 ? money(net) : `+${money(-net)}`
+
+    // Minimized on the desktop: one line that reads at a glance.
+    if (e.props.placement === 'widget') {
+      return <Text color={tone}>{net >= 0 ? `Saved ~${money(net)}` : `Extra ~${money(-net)}`}</Text>
+    }
+
+    const pick = (next: Scope) => () => {
+      scope = next
+      redraw($)
+    }
+    const card = (label: string, value: string, note: string) => (
+      <Box
+        flexDirection="column"
+        borderStyle="round"
+        borderColor="subtle"
+        paddingX="sm"
+        paddingY="xs"
+        flexGrow={1}
+        minWidth={16}
+      >
+        <Text size="caption" color="subtle">
+          {label}
+        </Text>
+        <Text size="heading" weight="semibold" tabular>
+          {value}
+        </Text>
+        <Text size="footnote" color="subtle">
+          {note}
+        </Text>
+      </Box>
+    )
+
+    const row = (label: string, count: string, amount: string, color: 'success' | 'warning' | 'subtle') => (
+      <Box flexDirection="row" justifyContent="space-between" gap="sm">
+        <Box flexDirection="row" gap="xs">
+          <Text>{label}</Text>
+          <Text size="footnote" color="subtle">
+            {count}
+          </Text>
+        </Box>
+        <Text weight="semibold" color={color} tabular>
+          {amount}
+        </Text>
+      </Box>
+    )
+
+    const header = (
+      <Box flexDirection="row" justifyContent="space-between" alignItems="center" flexWrap="wrap" gap="sm">
+        <Box flexDirection="column">
+          <Text size="heading" weight="bold">
+            Model picker
+          </Text>
+          <Text size="caption" color="subtle">
+            Estimated savings at API list prices
+          </Text>
+        </Box>
+        <Box flexDirection="row" gap="xs" flexWrap="wrap">
+          <Button key="scope-chat" label="This chat" variant={scope === 'chat' ? 'primary' : 'secondary'} onPress={pick('chat')} />
+          <Button key="scope-all" label="All chats" variant={scope === 'all' ? 'primary' : 'secondary'} onPress={pick('all')} />
+          <Button key="close" label="Close" variant="secondary" role="dismiss" onPress={() => $.ui.close({ id: PANE })} />
+        </Box>
+      </Box>
+    )
+
+    const notes = (
+      <Box flexDirection="column">
+        {STATS_NOTES.map(n => (
+          <Text size="caption" color="subtle">
+            {n}
+          </Text>
+        ))}
+      </Box>
+    )
+
+    if (!t.requests && !t.judgeCalls) {
+      return (
+        <Box flexDirection="column" gap="md" padding="sm">
+          {header}
+          <Box flexDirection="column" borderStyle="round" borderColor="subtle" padding="md" alignItems="center">
+            <Text weight="semibold">Nothing counted yet</Text>
+            <Text size="footnote" color="subtle">
+              {scope === 'chat' ? 'Send a prompt in this chat, then look again.' : 'No chat has been counted yet.'}
+            </Text>
+          </Box>
+          {notes}
+        </Box>
+      )
+    }
+
+    const withPicker = t.actualUsd + t.judgeUsd
+    const top = Math.max(t.ownUsd, withPicker, 1e-9)
+    const share = t.ownUsd > 0 ? Math.round((Math.abs(net) / t.ownUsd) * 100) : 0
+
+    return (
+      <Box flexDirection="column" gap="md" padding="sm">
+        {header}
+
+        <Box flexDirection="column" borderStyle="round" borderColor={tone} paddingX="md" paddingY="sm">
+          <Text size="caption" color="subtle">
+            {net >= 0 ? 'Estimated saving' : 'Estimated extra cost'}
+          </Text>
+          <Text size="title" weight="bold" color={tone} tabular>
+            {headline}
+          </Text>
+          <Text size="footnote" color="subtle">
+            {share ? `${share}% ${net >= 0 ? 'less' : 'more'} than on your own models` : 'Same as on your own models'}
+          </Text>
+        </Box>
+
+        <Box flexDirection="column" gap="xs" borderStyle="round" borderColor="subtle" paddingX="md" paddingY="sm">
+          <Text size="caption" color="subtle">
+            Where it comes from
+          </Text>
+          {row(
+            'Cheaper models',
+            `${t.cheaper} ${t.cheaper === 1 ? 'request' : 'requests'}`,
+            cheaperText(t),
+            !t.cheaper ? 'subtle' : t.cheaperSavedUsd >= 0 ? 'success' : 'warning',
+          )}
+          {row(
+            'Stronger models',
+            `${t.stronger} ${t.stronger === 1 ? 'request' : 'requests'}`,
+            strongerText(t),
+            t.stronger ? 'warning' : 'subtle',
+          )}
+          {row('Judge', `${t.judgeCalls} ${t.judgeCalls === 1 ? 'call' : 'calls'}`, money(t.judgeUsd), 'subtle')}
+        </Box>
+
+        <Box flexDirection="row" flexWrap="wrap" gap="sm">
+          {card('Requests', String(t.requests), `${t.cheaper} cheaper · ${t.stronger} stronger`)}
+          {card('Tokens', tokenCount(t.tokens), `${tokenCount(t.switchedTokens)} on another model`)}
+        </Box>
+
+        <Box flexDirection="column" gap="xs" borderStyle="round" borderColor="subtle" paddingX="md" paddingY="sm">
+          <Text size="caption" color="subtle">
+            Cost comparison
+          </Text>
+          <Text size="footnote">Your own models</Text>
+          <Progress label="Your own models" value={t.ownUsd} max={top} valueText={money(t.ownUsd)} color="inactive" />
+          <Text size="footnote">With the picker, judge included</Text>
+          <Progress label="With the picker" value={withPicker} max={top} valueText={money(withPicker)} color={tone} />
+          {t.effortOnly ? (
+            <Text size="footnote" color="subtle">
+              {`${t.effortOnly} effort-only ${t.effortOnly === 1 ? 'change' : 'changes'}, not credited`}
+            </Text>
+          ) : null}
+        </Box>
+
+        {notes}
+      </Box>
+    )
   })
 
   // The app's own model menu keeps showing your choice, so the footer names what the last request really used:
