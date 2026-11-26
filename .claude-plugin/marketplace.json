@@ -1,0 +1,5 @@
+{
+  "name": "model-picker-market",
+  "owner": { "name": "model-picker" },
+  "plugins": [{ "name": "model-picker", "source": "./" }]
+}
